@@ -2,6 +2,8 @@
 
 This repository snapshot contains a small set of independently written C++20 research modules and tests from a larger Super Mario Galaxy 2 reverse-engineering and porting effort. It is not a complete game, a game source-code release, or a playable Mac/iPhone application.
 
+An [experimental macOS Apple Silicon application preview](https://github.com/alexkypraiou/smg2-reverse-engineering/releases/tag/macos-preview-0.1) is available separately. It requires user-supplied game data and **a normal fresh launch currently stops at a known error**. It is not a verified playable release.
+
 ## What is included
 
 - Host-side implementations of selected CubeGravity, PlanetGravity, and PointGravity operations.
@@ -41,7 +43,7 @@ The optional `fst_game_data` CTest requires a locally extracted, legally obtaine
 
 ## Data, dependencies, and provenance
 
-No Nintendo game image, extracted game data, proprietary game binary, game-derived pseudocode/disassembly, artwork, audio, screenshots, videos, save files, or user data is included. No runnable game is included. Local proprietary game data must be supplied separately by the user where lawful.
+The source tree includes no Nintendo game image, extracted game data, proprietary game binary, game-derived pseudocode/disassembly, artwork, audio, screenshots, videos, save files, or user data. The separate macOS preview archive contains a game-specific generated module but no game image, extracted game data, checkpoint or personal save. Compatible game data must be supplied separately by the user where lawful.
 
 Third-party dependencies used by the larger private runtime are not vendored here. The included native library/tests use the C++ standard library and CMake. The provenance documents identify the behavioral references used for these modules; in particular, Garigari is a separate public reference project and is not bundled here. Its own license does not automatically license this project's original contributions.
 
