@@ -1,0 +1,67 @@
+Native C++20 gravity modules
+
+Scope
+-----
+These are independently written native C++ modules for selected CubeGravity,
+PlanetGravity, and PointGravity operations. They are not a complete game,
+playable port, Wii ABI emulation, or replacement for the Wii runtime. The
+interfaces use portable Vec3f values and host-side configuration types. The
+PointGravity transform type is a native affine representation. The modules
+contain no game assets or complete Wii runtime.
+
+Evidence and reference
+----------------------
+Original USA Rev 0 main.dol SHA-1: 7d79810889824edd01c4ff02624713060a69818c
+Local reference checkout: Garigari, commit
+c590a376e00a6b5d4f2bc963dfd6f5516080e07d
+Reference source: src/Game/Gravity/CubeGravity.cpp, calcGravityArea and
+calcFaceGravity; declarations: include/Game/Gravity/CubeGravity.hpp.
+Symbol records in config/SB4E01/symbols.txt identify calcGravityArea at
+0x80223580 (size 0x1E0) and calcFaceGravity at 0x80223760 (size 0x170).
+The matching DOL-derived assembly was inspected locally and is not included
+in this public snapshot.
+These names are imported reference symbols for the exact-hash binary; no C++
+reconstruction of the full game is represented here.
+
+The same reference declares PlanetGravity in
+include/Game/Gravity/PlanetGravity.hpp and implements its base behavior in
+src/Game/Gravity/PlanetGravity.cpp. The native range checks and mass-position
+helper track that implementation. The corresponding Rev 0 DOL routines are
+calcGravity 0x802271F0, calcOwnGravityVector 0x80227330,
+isInRangeSquare 0x80227340, isInRangeDistance 0x80227380, and
+calcGravityFromMassPosition 0x802273B0. The base calcOwnGravityVector routine
+always returns false in the DOL.
+
+The Garigari checkout has no PointGravity source or header. Its native
+calcOwnGravityVector and updateTransform behavior are reconstructed from the
+matching DTK assembly inspected locally (not included here): the vector
+routine at 0x80227850 and updateMtx at 0x80227970. The routine subtracts the
+query position from the transformed point, obtains the scalar with PSVECMag,
+uses the scalar 0.001 near-zero test, and applies the inherited strict range
+check before writing optional outputs. The native transform models the observed
+matrix-times-local-point operation without adopting the Wii matrix ABI.
+
+Behavior and numeric caveat
+---------------------------
+The module follows the reference's region encoding, strict comparisons,
+active-face mask bits, face selection, basis normalization, and distance
+clamping. The DOL-derived face routine delegates magnitude and normalization
+to the Wii SDK's PSVECMag and PSVECNormalize helpers. This implementation uses
+host float operations and std::sqrt; it preserves single-precision data and
+operation order where practical, but does not promise bitwise parity with
+those helpers.
+
+PlanetGravity follows the source-informed 4,000,000 / distance-squared force,
+minimum effective radius of 1, inverse flag, and follower zeroing. Its
+mass-position helper matches the vector overload's per-component 0.001
+near-zero test. PointGravity matches the DOL's distinct scalar magnitude
+near-zero test, which is strict and can yield a different result for short
+diagonal vectors. PointGravity position and PlanetGravity falloff were tested
+in the host implementation; host float operations are not guaranteed to match
+the Wii SDK PSVECMag/PSVECNormalize results bit for bit.
+
+Attribution
+-----------
+The reference repository declares CC0 1.0 Universal in its root LICENSE.
+This module is an independent implementation based on the cited behavior and
+binary evidence, and is not integrated into or submitted to that repository.

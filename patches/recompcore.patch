@@ -1,0 +1,1220 @@
+diff --git a/Source/Core/Core/Boot/Boot_BS2Emu.cpp b/Source/Core/Core/Boot/Boot_BS2Emu.cpp
+index 254c22a..ae4efab 100644
+--- a/Source/Core/Core/Boot/Boot_BS2Emu.cpp
++++ b/Source/Core/Core/Boot/Boot_BS2Emu.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cstdint>
++#include <array>
++#include <cstdio>
+ #include <map>
+ #include <optional>
+ #include <string>
+@@ -9,12 +11,14 @@
+ 
+ #include "Common/CommonPaths.h"
+ #include "Common/CommonTypes.h"
++#include "Common/Crypto/SHA1.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/MsgHandler.h"
+ #include "Common/NandPaths.h"
+ #include "Common/SettingsHandler.h"
+ 
+ #include "Core/Boot/Boot.h"
++#include "Core/Boot/DolReader.h"
+ #include "Core/CommonTitles.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/ConfigManager.h"
+@@ -23,6 +27,7 @@
+ #include "Core/HLE/HLE.h"
+ #include "Core/HW/DVD/AMMediaboard.h"
+ #include "Core/HW/DVD/DVDInterface.h"
++#include "Core/HW/CPU.h"
+ #include "Core/HW/EXI/EXI_DeviceIPL.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/IOS/DI/DI.h"
+@@ -55,10 +60,97 @@ void PresetTimeBaseTicks(Core::System& system, const Core::CPUThreadGuard& guard
+ 
+   PowerPC::MMU::HostWrite<u64>(guard, time_base_ticks, 0x800030D8);
+ }
++
++#ifdef MODERNGEKKO_NATIVE_ONLY
++// Native SMG2 boot profile. The disc's apploader is PPC code outside the AOT
++// module; running it through SingleStep would violate the native-only path.
++// Read the verified DOL and its disc metadata directly on the host instead.
++// IOS, DI and ES initialization still follows EmulatedBS2_Wii below.
++bool LoadNativeSmg2Disc(Core::System& system, const DiscIO::VolumeDisc& volume)
++{
++  constexpr u32 kDolSize = 7546080;
++  constexpr u32 kMem1End = 0x81800000;
++  constexpr u32 kArenaHi = 0x817A0000;  // Excludes the fixed AOT HomeButton RSO.
++  constexpr u32 kRsoEnd = 0x817C3600;
++  constexpr u32 kBi2Size = 0x2000;
++  constexpr u32 kBi2Address = kMem1End - kBi2Size;
++  const auto reject = [](const char* reason) {
++    std::fprintf(stderr, "[native-only] direct disc boot rejected: %s\n", reason);
++    return false;
++  };
++  if (volume.GetGameID() != "SB4E01" || volume.GetRevision().value_or(0xffff) != 0)
++    return reject("only the pinned SB4E01 revision 0 profile is implemented");
++  const auto partition = volume.GetGamePartition();
++  const auto dol_word = volume.ReadSwapped<u32>(0x420, partition);
++  const auto fst_word = volume.ReadSwapped<u32>(0x424, partition);
++  const auto fst_size_word = volume.ReadSwapped<u32>(0x428, partition);
++  if (!dol_word || !fst_word || !fst_size_word || !*dol_word || !*fst_word ||
++      !*fst_size_word || *fst_size_word > 0x80000)
++    return reject("invalid DOL/FST partition header");
++  const u32 fst_size = *fst_size_word * 4;
++  const u32 fst_address = (kBi2Address - fst_size) & ~31u;
++  if (fst_address < kRsoEnd || system.GetMemory().GetRamSizeReal() != 0x1800000)
++    return reject("FST or memory layout conflicts with the native profile");
++
++  std::vector<u8> dol(kDolSize);
++  std::vector<u8> fst(fst_size);
++  std::array<u8, kBi2Size> bi2{};
++  if (!volume.Read(static_cast<u64>(*dol_word) * 4, dol.size(), dol.data(), partition) ||
++      !volume.Read(static_cast<u64>(*fst_word) * 4, fst.size(), fst.data(), partition) ||
++      !volume.Read(0x440, bi2.size(), bi2.data(), partition))
++    return reject("could not read complete DOL/FST/BI2 data");
++  constexpr Common::SHA1::Digest kMainSha1 = {0x7d, 0x79, 0x81, 0x08, 0x89, 0x82, 0x4e,
++                                           0xdd, 0x01, 0xc4, 0xff, 0x02, 0x62, 0x47,
++                                           0x13, 0x06, 0x0a, 0x69, 0x81, 0x8c};
++  if (Common::SHA1::CalculateDigest(dol) != kMainSha1)
++    return reject("main.dol does not match the AOT SB4E01 revision 0 input");
++  const auto read_be32 = [](const u8* p) {
++    return (static_cast<u32>(p[0]) << 24) | (static_cast<u32>(p[1]) << 16) |
++           (static_cast<u32>(p[2]) << 8) | p[3];
++  };
++  if (fst.size() < 12 || read_be32(fst.data()) != 0x01000000 ||
++      read_be32(fst.data() + 8) < 1 ||
++      static_cast<u64>(read_be32(fst.data() + 8)) * 12 > fst.size())
++    return reject("invalid FST root or entry count");
++  const u32 bss_start = read_be32(dol.data() + 0xd8);
++  const u32 bss_size = read_be32(dol.data() + 0xdc);
++  if (bss_start < 0x80004000 || static_cast<u64>(bss_start) + bss_size > kArenaHi)
++    return reject("DOL BSS conflicts with reserved native memory");
++  DolReader reader(std::move(dol));
++  if (!reader.IsValid() || !reader.IsWii() || reader.GetEntryPoint() != 0x80004050)
++    return reject("invalid native DOL entry point or CPU profile");
++
++  auto& memory = system.GetMemory();
++  // The DOL aggregate BSS overlaps initialized data in this title. Clear it
++  // FIRST, then copy the initialized sections so their bytes survive.
++  memory.Memset(bss_start, 0, bss_size);
++  if (!reader.LoadIntoMemory(system))
++    return reject("DOL section loading failed");
++  memory.CopyToEmu(fst_address, fst.data(), fst.size());
++  memory.CopyToEmu(kBi2Address, bi2.data(), bi2.size());
++  memory.Write_U32(kArenaHi, 0x34);
++  // Wii OSInit prefers IOS's arena end at 0x3110 over BootInfo::arenaHi.
++  // BootIOS initializes that field to 0x81800000, so cap BOTH sources.
++  memory.Write_U32(kArenaHi, 0x3110);
++  memory.Write_U32(fst_address, 0x38);
++  memory.Write_U32(fst_size, 0x3c);
++  memory.Write_U32(kBi2Address, 0xf4);
++  memory.Write_U32(memory.Read_U32(0x3140), 0x3188);
++  system.GetPPCState().pc = reader.GetEntryPoint();
++  std::fprintf(stderr,
++               "[native-only] host-loaded SB4E01 DOL entry=%08x FST=%08x+%x BI2=%08x arenaHi=%08x; no PPC apploader executed\n",
++               reader.GetEntryPoint(), fst_address, fst_size, kBi2Address, kArenaHi);
++  return true;
++}
++#endif
+ }  // Anonymous namespace
+ 
+ void CBoot::RunFunction(Core::System& system, u32 address)
+ {
++#ifdef MODERNGEKKO_NATIVE_ONLY
++  std::fprintf(stderr, "[native-only] refusing uncompiled boot function %08x\n", address);
++  system.GetCPU().Break();
++#else
+   auto& power_pc = system.GetPowerPC();
+   auto& ppc_state = power_pc.GetPPCState();
+ 
+@@ -67,6 +159,7 @@ void CBoot::RunFunction(Core::System& system, u32 address)
+ 
+   while (ppc_state.pc != 0x00)
+     power_pc.SingleStep();
++#endif
+ }
+ 
+ void CBoot::SetupMSR(Core::System& system)
+@@ -142,6 +235,14 @@ bool CBoot::RunApploader(Core::System& system, const Core::CPUThreadGuard& guard
+                          const DiscIO::VolumeDisc& volume,
+                          const std::vector<DiscIO::Riivolution::Patch>& riivolution_patches)
+ {
++#ifdef MODERNGEKKO_NATIVE_ONLY
++  if (!is_wii || !riivolution_patches.empty())
++  {
++    std::fprintf(stderr, "[native-only] unsupported boot platform or disc patches\n");
++    return false;
++  }
++  return LoadNativeSmg2Disc(system, volume);
++#else
+   const DiscIO::Partition partition = volume.GetGamePartition();
+ 
+   // Load Apploader to Memory - The apploader is hardcoded to begin at 0x2440 on the disc,
+@@ -242,6 +343,7 @@ bool CBoot::RunApploader(Core::System& system, const Core::CPUThreadGuard& guard
+   }
+ 
+   return true;
++#endif
+ }
+ 
+ void CBoot::SetupGCMemory(Core::System& system, const Core::CPUThreadGuard& guard)
+diff --git a/Source/Core/Core/HW/WiimoteEmu/Dynamics.cpp b/Source/Core/Core/HW/WiimoteEmu/Dynamics.cpp
+index ebf24f7..e333ef3 100644
+--- a/Source/Core/Core/HW/WiimoteEmu/Dynamics.cpp
++++ b/Source/Core/Core/HW/WiimoteEmu/Dynamics.cpp
+@@ -80,9 +80,10 @@ Common::Quaternion ComplementaryFilter(const Common::Quaternion& gyroscope,
+ }
+ 
+ void EmulateShake(PositionalState* state, ControllerEmu::Shake* const shake_group,
+-                  float time_elapsed)
++                  const ControllerEmu::InputOverrideFunction& override_func, float time_elapsed)
+ {
+-  auto target_position = shake_group->GetState() * float(shake_group->GetIntensity() / 2);
++  auto target_position = shake_group->GetState(override_func) *
++                         float(shake_group->GetIntensity() / 2);
+   for (std::size_t i = 0; i != target_position.data.size(); ++i)
+   {
+     if (state->velocity.data[i] * std::copysign(1.f, target_position.data[i]) < 0 ||
+diff --git a/Source/Core/Core/HW/WiimoteEmu/Dynamics.h b/Source/Core/Core/HW/WiimoteEmu/Dynamics.h
+index 8f35c30..978f446 100644
+--- a/Source/Core/Core/HW/WiimoteEmu/Dynamics.h
++++ b/Source/Core/Core/HW/WiimoteEmu/Dynamics.h
+@@ -75,7 +75,9 @@ void ApproachPositionWithJerk(PositionalState* state, const Common::Vec3& target
+ void ApproachAngleWithAccel(RotationalState* state, const Common::Vec3& target, float max_accel,
+                             float time_elapsed);
+ 
+-void EmulateShake(PositionalState* state, ControllerEmu::Shake* shake_group, float time_elapsed);
++void EmulateShake(PositionalState* state, ControllerEmu::Shake* shake_group,
++                  const ControllerEmu::InputOverrideFunction& override_func,
++                  float time_elapsed);
+ void EmulateTilt(RotationalState* state, ControllerEmu::Tilt* tilt_group, float time_elapsed);
+ void EmulateSwing(MotionState* state, ControllerEmu::Force* swing_group, float time_elapsed);
+ void EmulatePoint(MotionState* state, ControllerEmu::Cursor* ir_group,
+diff --git a/Source/Core/Core/HW/WiimoteEmu/Extension/Nunchuk.cpp b/Source/Core/Core/HW/WiimoteEmu/Extension/Nunchuk.cpp
+index 6745602..38d67de 100644
+--- a/Source/Core/Core/HW/WiimoteEmu/Extension/Nunchuk.cpp
++++ b/Source/Core/Core/HW/WiimoteEmu/Extension/Nunchuk.cpp
+@@ -77,7 +77,7 @@ void Nunchuk::BuildDesiredExtensionState(DesiredExtensionState* target_state)
+   // Acceleration data:
+   EmulateSwing(&m_swing_state, m_swing, 1.f / ::Wiimote::UPDATE_FREQ);
+   EmulateTilt(&m_tilt_state, m_tilt, 1.f / ::Wiimote::UPDATE_FREQ);
+-  EmulateShake(&m_shake_state, m_shake, 1.f / ::Wiimote::UPDATE_FREQ);
++  EmulateShake(&m_shake_state, m_shake, {}, 1.f / ::Wiimote::UPDATE_FREQ);
+ 
+   const auto transformation =
+       GetRotationalMatrix(-m_tilt_state.angle) * GetRotationalMatrix(-m_swing_state.angle);
+diff --git a/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp b/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp
+index 3350787..61a82db 100644
+--- a/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp
++++ b/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp
+@@ -742,7 +742,8 @@ void Wiimote::StepDynamics()
+   EmulateSwing(&m_swing_state, m_swing, 1.f / ::Wiimote::UPDATE_FREQ);
+   EmulateTilt(&m_tilt_state, m_tilt, 1.f / ::Wiimote::UPDATE_FREQ);
+   EmulatePoint(&m_point_state, m_ir, m_input_override_function, 1.f / ::Wiimote::UPDATE_FREQ);
+-  EmulateShake(&m_shake_state, m_shake, 1.f / ::Wiimote::UPDATE_FREQ);
++  EmulateShake(&m_shake_state, m_shake, m_input_override_function,
++               1.f / ::Wiimote::UPDATE_FREQ);
+   EmulateIMUCursor(&m_imu_cursor_state, m_imu_ir, m_imu_accelerometer, m_imu_gyroscope,
+                    1.f / ::Wiimote::UPDATE_FREQ);
+ }
+diff --git a/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.h b/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.h
+index 1e07e2a..7cd0866 100644
+--- a/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.h
++++ b/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.h
+@@ -123,6 +123,7 @@ public:
+   static constexpr const char* ACCELEROMETER_GROUP = "IMUAccelerometer";
+   static constexpr const char* GYROSCOPE_GROUP = "IMUGyroscope";
+   static constexpr const char* IR_GROUP = "IR";
++  static constexpr const char* SHAKE_GROUP = _trans("Shake");
+   static constexpr const char* IR_PASSTHROUGH_GROUP = "IRPassthrough";
+ 
+   static constexpr const char* A_BUTTON = "A";
+diff --git a/Source/Core/Core/PowerPC/JitInterface.cpp b/Source/Core/Core/PowerPC/JitInterface.cpp
+index d098c19..8feef10 100644
+--- a/Source/Core/Core/PowerPC/JitInterface.cpp
++++ b/Source/Core/Core/PowerPC/JitInterface.cpp
+@@ -319,6 +319,14 @@ void JitInterface::InvalidateICacheLinesFromJIT(JitInterface& jit_interface, u32
+ 
+ void JitInterface::CompileExceptionCheck(ExceptionType type)
+ {
++#ifdef MODERNGEKKO_NATIVE_ONLY
++  // Static recompilation checks pending synchronous/external exceptions at
++  // every generated dispatch boundary. This routine only records a call site
++  // and invalidates a JIT block so the JIT can fold in an exception check;
++  // native-only builds have no JIT block to recompile.
++  (void)type;
++  return;
++#else
+   if (!m_jit)
+     return;
+ 
+@@ -365,6 +373,7 @@ void JitInterface::CompileExceptionCheck(ExceptionType type)
+     // cache leaves the block standing and the hook firing.
+     target->GetBlockCache()->InvalidateICache(ppc_state.pc, 4, true);
+   }
++#endif
+ }
+ 
+ void JitInterface::CompileExceptionCheckFromJIT(JitInterface& jit_interface, ExceptionType type)
+diff --git a/Source/Core/Core/PowerPC/MMUDebug.cpp b/Source/Core/Core/PowerPC/MMUDebug.cpp
+index db12bc2..cc38567 100644
+--- a/Source/Core/Core/PowerPC/MMUDebug.cpp
++++ b/Source/Core/Core/PowerPC/MMUDebug.cpp
+@@ -5,9 +5,17 @@
+ #include "Core/PowerPC/MMUBAT.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <concepts>
++#include <cstdio>
++#include <iterator>
+ #include <optional>
+ #include <string>
++#include <dlfcn.h>
++
++#if defined(__APPLE__) || defined(__linux__)
++#include <execinfo.h>
++#endif
+ 
+ #include "Common/Assert.h"
+ #include "Common/Logging/Log.h"
+@@ -26,6 +34,43 @@
+ namespace PowerPC
+ {
+ 
++namespace
++{
++void LogFirstHostRead(const char* kind, u32 address, u32 guest_pc, u32 msr,
++                      bool data_translation_enabled, unsigned space, void* caller)
++{
++#if defined(__APPLE__) || defined(__linux__)
++  static std::atomic_flag logged = ATOMIC_FLAG_INIT;
++  const bool cached_mem1 = address >= 0x80000000u && address < 0x90000000u;
++  const bool cached_mem2 = address >= 0x90000000u && address < 0xA0000000u;
++  if (data_translation_enabled || (!cached_mem1 && !cached_mem2))
++    return;
++  if (logged.test_and_set(std::memory_order_relaxed))
++    return;
++  Dl_info caller_info{};
++  const bool has_caller_info = dladdr(caller, &caller_info) != 0;
++  const uintptr_t caller_offset = has_caller_info ?
++      reinterpret_cast<uintptr_t>(caller) - reinterpret_cast<uintptr_t>(caller_info.dli_saddr) : 0;
++  std::fprintf(stderr,
++               "[mmu-host-read-entry] kind=%s address=%08x guest_pc=%08x msr=%08x space=%u caller=%p symbol=%s+0x%zx image=%s\n",
++               kind, address, guest_pc, msr, space, caller,
++               has_caller_info && caller_info.dli_sname ? caller_info.dli_sname : "?",
++               static_cast<size_t>(caller_offset),
++               has_caller_info && caller_info.dli_fname ? caller_info.dli_fname : "?");
++  void* frames[32];
++  const int frame_count = backtrace(frames, static_cast<int>(std::size(frames)));
++  if (frame_count > 0)
++    backtrace_symbols_fd(frames, frame_count, 2);
++#else
++  (void)kind;
++  (void)address;
++  (void)guest_pc;
++  (void)msr;
++  (void)space;
++#endif
++}
++}  // namespace
++
+ // Declared extern or defined in MMU.cpp
+ u32 EFB_Read(const u32 addr);
+ void EFB_Write(u32 data, u32 addr);
+@@ -74,6 +119,9 @@ std::optional<ReadResult<T>> MMU::HostTryRead(const Core::CPUThreadGuard& guard,
+     return std::nullopt;
+ 
+   auto& mmu = guard.GetSystem().GetMMU();
++  LogFirstHostRead("HostTryRead", address, mmu.m_ppc_state.pc, mmu.m_ppc_state.msr.Hex,
++                   static_cast<bool>(mmu.m_ppc_state.msr.DR), static_cast<unsigned>(space),
++                   __builtin_return_address(0));
+   switch (space)
+   {
+   case RequestedAddressSpace::Effective:
+@@ -115,6 +163,8 @@ template <std::unsigned_integral T>
+ T MMU::HostRead(const Core::CPUThreadGuard& guard, const u32 address)
+ {
+   auto& mmu = guard.GetSystem().GetMMU();
++  LogFirstHostRead("HostRead", address, mmu.m_ppc_state.pc, mmu.m_ppc_state.msr.Hex,
++                   static_cast<bool>(mmu.m_ppc_state.msr.DR), 0, __builtin_return_address(0));
+   return mmu.ReadFromHardware<XCheckTLBFlag::NoException, T>(address);
+ }
+ template u8 MMU::HostRead<u8>(const Core::CPUThreadGuard& guard, const u32 address);
+diff --git a/Source/Core/Core/PowerPC/MMU_Tables.cpp b/Source/Core/Core/PowerPC/MMU_Tables.cpp
+index 9367340..e434453 100644
+--- a/Source/Core/Core/PowerPC/MMU_Tables.cpp
++++ b/Source/Core/Core/PowerPC/MMU_Tables.cpp
+@@ -5,13 +5,19 @@
+ #include "Core/PowerPC/MMUBAT.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <bit>
+ #include <cstddef>
++#include <cstdio>
+ #include <cstring>
+ #include <memory>
+ #include <string>
+ #include <utility>
+ 
++#if defined(__APPLE__) || defined(__linux__)
++#include <execinfo.h>
++#endif
++
+ #ifdef _M_X86_64
+ #include <emmintrin.h>
+ #endif
+@@ -42,6 +48,8 @@ namespace PowerPC
+ template <XCheckTLBFlag flag, std::unsigned_integral T, bool never_translate>
+ T MMU::ReadFromHardware(u32 em_address)
+ {
++  const u32 original_address = em_address;
++  bool address_translated = false;
+   // ReadFromHardware is currently used with XCheckTLBFlag::OpcodeNoException by host instruction
+   // functions. Actual instruction decoding (which can raise exceptions and uses icache) is handled
+   // by TryReadInstruction.
+@@ -77,6 +85,7 @@ T MMU::ReadFromHardware(u32 em_address)
+       return 0;
+     }
+     em_address = translated_addr.address;
++    address_translated = true;
+     wi = translated_addr.wi;
+   }
+ 
+@@ -166,6 +175,49 @@ T MMU::ReadFromHardware(u32 em_address)
+   // Don't show a panic alert for the specific access Game Boy Interface does.
+   if (em_address != 0x10000000 || (m_ppc_state.pc >> 28) != 0)
+   {
++#if defined(__APPLE__) || defined(__linux__)
++    static std::atomic_flag first_unmapped_read = ATOMIC_FLAG_INIT;
++    if (!first_unmapped_read.test_and_set(std::memory_order_relaxed))
++    {
++      const u32 ibat = m_ibat_table[original_address >> BAT_INDEX_SHIFT];
++      const u32 dbat = m_dbat_table[original_address >> BAT_INDEX_SHIFT];
++      std::fprintf(stderr,
++                   "[mmu-first-unmapped-read] pc=%08x ea=%08x translated=%08x did_translate=%u flag=%u size=%zu never_translate=%u msr=%08x IR=%u DR=%u ibat=%08x dbat=%08x\n",
++                   m_ppc_state.pc, original_address, em_address,
++                   static_cast<unsigned>(address_translated),
++                   static_cast<unsigned>(flag), sizeof(T), static_cast<unsigned>(never_translate),
++                   m_ppc_state.msr.Hex, static_cast<unsigned>(static_cast<bool>(m_ppc_state.msr.IR)),
++                   static_cast<unsigned>(static_cast<bool>(m_ppc_state.msr.DR)),
++                   ibat, dbat);
++      const u32 pc = m_ppc_state.pc;
++      const u32 ram_size = m_memory.GetRamSizeReal();
++      const u8* ram = m_memory.GetRAM();
++      if (ram && pc >= 0x80000000u && pc - 0x80000000u <= ram_size - 4u)
++      {
++        const u8* instruction = ram + (pc - 0x80000000u);
++        const u32 raw = (static_cast<u32>(instruction[0]) << 24) |
++                        (static_cast<u32>(instruction[1]) << 16) |
++                        (static_cast<u32>(instruction[2]) << 8) | instruction[3];
++        std::fprintf(stderr,
++                     "[mmu-first-unmapped-read-context] lr=%08x instruction=%08x ram=%p ram_size=%08x\n",
++                     m_ppc_state.spr[SPR_LR], raw, static_cast<const void*>(ram), ram_size);
++      }
++      else
++      {
++        std::fprintf(stderr,
++                     "[mmu-first-unmapped-read-context] lr=%08x instruction=<unavailable> ram=%p ram_size=%08x\n",
++                     m_ppc_state.spr[SPR_LR], static_cast<const void*>(ram), ram_size);
++      }
++      std::fprintf(stderr, "[mmu-first-unmapped-read-gpr]");
++      for (size_t i = 0; i < std::size(m_ppc_state.gpr); ++i)
++        std::fprintf(stderr, " r%zu=%08x", i, m_ppc_state.gpr[i]);
++      std::fputc('\n', stderr);
++      void* frames[32];
++      const int frame_count = backtrace(frames, static_cast<int>(std::size(frames)));
++      if (frame_count > 0)
++        backtrace_symbols_fd(frames, frame_count, 2);
++    }
++#endif
+     PanicAlertFmt("Unable to resolve read address {:x} PC {:x}", em_address, m_ppc_state.pc);
+     if (m_system.IsPauseOnPanicMode())
+     {
+diff --git a/Source/Core/Core/PowerPC/PowerPC.cpp b/Source/Core/Core/PowerPC/PowerPC.cpp
+index 49c278b..9beb474 100644
+--- a/Source/Core/Core/PowerPC/PowerPC.cpp
++++ b/Source/Core/Core/PowerPC/PowerPC.cpp
+@@ -200,6 +200,13 @@ void PowerPCManager::ResetRegisters()
+ 
+ void PowerPCManager::InitializeCPUCore(CPUCore cpu_core)
+ {
++#ifdef MODERNGEKKO_NATIVE_ONLY
++  // Native-only builds never initialize or select an interpreter/JIT core.
++  // The StaticRecomp core itself fails closed if no native module is loaded.
++  (void)cpu_core;
++  m_cpu_core_base = m_system.GetJitInterface().InitJitCore(CPUCore::StaticRecomp);
++  m_mode = CoreMode::JIT;
++#else
+   // We initialize the interpreter because
+   // it is used on boot and code window independently.
+   auto& interpreter = m_system.GetInterpreter();
+@@ -223,6 +230,7 @@ void PowerPCManager::InitializeCPUCore(CPUCore cpu_core)
+   }
+ 
+   m_mode = m_cpu_core_base == &interpreter ? CoreMode::Interpreter : CoreMode::JIT;
++#endif
+ }
+ 
+ std::span<const CPUCore> AvailableCPUCores()
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index e3581cc..1e67139 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -182,13 +182,17 @@ void StaticRecompCore::Init()
+ 
+   LoadModule();
+   m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
++  if (m_idle_pc != 0)
++    std::fprintf(stderr, "[staticrecomp] idle-skip configured pc=%08x\n", m_idle_pc);
+   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
+   m_lockstep_verifier->Init();
+ 
++#ifndef MODERNGEKKO_NATIVE_ONLY
+ #ifdef _M_ARM_64
+   m_fallback_jit = std::make_unique<JitArm64>(m_system);
+ #elif defined(_M_X86_64)
+   m_fallback_jit = std::make_unique<Jit64>(m_system);
++#endif
+ #endif
+   if (m_fallback_jit)
+   {
+@@ -203,12 +207,14 @@ void StaticRecompCore::Shutdown()
+   g_static_recomp_core = nullptr;
+   std::fprintf(stderr,
+                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
+-               "smc_failed=%u verifications=%llu reverify_events=%llu bursts=%llu cycles=%llu\n",
++               "smc_failed=%u verifications=%llu reverify_events=%llu bursts=%llu cycles=%llu "
++               "idle_pc=%08x idle_skips=%llu\n",
+                (unsigned long long)m_native_dispatches, (unsigned long long)m_fallback_steps,
+                (unsigned long long)m_native_exceptions,
+                (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
+                (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
+-               (unsigned long long)m_bursts, (unsigned long long)m_charged_cycles);
++               (unsigned long long)m_bursts, (unsigned long long)m_charged_cycles, m_idle_pc,
++               (unsigned long long)m_idle_skips);
+   std::vector<std::pair<u32, u64>> dispatch_samples(m_dispatch_samples.begin(),
+                                                     m_dispatch_samples.end());
+   std::sort(dispatch_samples.begin(), dispatch_samples.end(),
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index d084fea..b883400 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -168,11 +168,17 @@ private:
+   u32 m_host_call_passthrough_pc = 0;
+   bool m_host_call_passthrough = false;
+   std::unique_ptr<JitBase> m_fallback_jit;
++  // In native-only builds, generated helpers may encounter instructions that
++  // the static module deliberately leaves to the chassis. Record that site
++  // and stop after the generated block returns; never step it in the interpreter.
++  u32 m_native_only_fault_pc = 0;
++  u32 m_native_only_fault_instruction = 0;
+ 
+   u64 m_native_dispatches = 0;
+   u64 m_fallback_steps = 0;
+   u64 m_native_exceptions = 0;
+   u64 m_hook_fallback_instructions = 0;
++  u64 m_idle_skips = 0;
+   u64 m_timebase_cycle_remainder = 0;
+   std::unordered_map<u32, u64> m_dispatch_samples;
+   u64 m_bursts = 0;          // SyncIn..SyncOut native runs (diagnostic)
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+index 7b3d845..d1ed572 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+@@ -368,6 +368,16 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
+   cia = core->TranslateRelAddress(cia);
+   ++core->m_hook_fallback_instructions;
+ 
++#ifdef MODERNGEKKO_NATIVE_ONLY
++  // Generated code returns from the current chunk immediately after this
++  // callback. Defer stopping until dispatch() returns so no guest instruction
++  // after this unsupported site can run, and never execute it in Dolphin's
++  // interpreter.
++  core->m_native_only_fault_pc = cia;
++  core->m_native_only_fault_instruction = raw;
++  return;
++#else
++
+   // Lockstep: a block that fell back to the interpreter for an unmodeled
+   // instruction (DMA mtspr, cache op, ...) performed side effects not captured
+   // by the RAM journal / MMIO hooks, so re-running it on the shadow would
+@@ -413,4 +423,5 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
+   ppc.npc = cia + 4;
+   ppc.downcount -= system.GetInterpreter().SingleStepInner();
+   core->SyncIn();
++#endif
+ }
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+index d91ec2d..fec5133 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include <cstdio>
+ #include <cstdlib>
++#include <atomic>
+ #include <memory>
+ 
+ namespace
+@@ -32,6 +33,58 @@ struct FileCloser
+ 
+ using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
+ 
++const u8* GuestRamPointer(const CPUState& guest, u32 address, u32 size)
++{
++  const u32 normalized = address & ~0x40000000u;
++  if (normalized >= 0x80000000u && normalized - 0x80000000u <= guest.ram_size &&
++      size <= guest.ram_size - (normalized - 0x80000000u))
++    return guest.ram + (normalized - 0x80000000u);
++  if (guest.exram && normalized >= 0x90000000u &&
++      normalized - 0x90000000u <= guest.exram_size &&
++      size <= guest.exram_size - (normalized - 0x90000000u))
++    return guest.exram + (normalized - 0x90000000u);
++  return nullptr;
++}
++
++std::string GuestCString(const CPUState& guest, u32 address)
++{
++  std::string result;
++  result.reserve(128);
++  for (u32 i = 0; i < 256; ++i)
++  {
++    const u8* byte = GuestRamPointer(guest, address + i, 1);
++    if (!byte || *byte == 0)
++      break;
++    result.push_back(static_cast<char>(*byte));
++  }
++  return result;
++}
++
++u32 GuestWord(const CPUState& guest, u32 address)
++{
++  const u8* bytes = GuestRamPointer(guest, address, 4);
++  if (!bytes)
++    return 0xFFFFFFFFu;
++  return (static_cast<u32>(bytes[0]) << 24) | (static_cast<u32>(bytes[1]) << 16) |
++         (static_cast<u32>(bytes[2]) << 8) | bytes[3];
++}
++
++void LogGuestPanic(const CPUState& guest)
++{
++  static std::atomic_flag logged = ATOMIC_FLAG_INIT;
++  if (logged.test_and_set(std::memory_order_relaxed))
++    return;
++  std::fprintf(stderr,
++               "[native-guest-panic] pc=%08x lr=%08x filename=%08x:%s line=%u format=%08x:%s args=%08x,%08x,%08x,%08x,%08x\n",
++               guest.pc, guest.lr, guest.gpr[3], GuestCString(guest, guest.gpr[3]).c_str(),
++               guest.gpr[4], guest.gpr[5], GuestCString(guest, guest.gpr[5]).c_str(),
++               guest.gpr[6], guest.gpr[7], guest.gpr[8], guest.gpr[9], guest.gpr[10]);
++  std::fprintf(stderr, "[native-guest-panic-stack]");
++  for (u32 i = 0; i < 16; ++i)
++    std::fprintf(stderr, " %08x", GuestWord(guest, guest.gpr[1] + i * 4));
++  std::fputc('\n', stderr);
++}
++
+ FilePtr OpenDispatchTrace()
+ {
+   const char* path = std::getenv("STATICRECOMP_TRACE_FILE");
+@@ -53,7 +106,9 @@ void StaticRecompCore::Run()
+   auto& core_timing = m_system.GetCoreTiming();
+   auto& power_pc = m_system.GetPowerPC();
+   auto& ppc = power_pc.GetPPCState();
++#ifndef MODERNGEKKO_NATIVE_ONLY
+   auto& interpreter = m_system.GetInterpreter();
++#endif
+   auto& memory = m_system.GetMemory();
+   const CPU::State* state_ptr = m_system.GetCPU().GetStatePtr();
+   FilePtr dispatch_trace = OpenDispatchTrace();
+@@ -63,7 +118,14 @@ void StaticRecompCore::Run()
+   m_guest.exram = memory.GetEXRAM();
+   m_guest.exram_size = memory.GetExRamSizeReal();
+   InitLookupTable(m_guest.ram_size, m_guest.exram_size);
++#ifdef MODERNGEKKO_NATIVE_ONLY
++  // Lockstep validation steps a shadow CPU with Dolphin's interpreter. Keep
++  // that path unavailable in native-only builds even if a config or test
++  // enables lockstep globally.
++  const bool lockstep_enabled = false;
++#else
+   const bool lockstep_enabled = m_lockstep_verifier->IsEnabled();
++#endif
+   const auto fast_dispatchable_at = [this](u32 address) {
+     if (m_has_rel_modules || !m_forced_fallback_ranges.empty())
+       return FastDispatchableAt(address);
+@@ -71,7 +133,11 @@ void StaticRecompCore::Run()
+       return false;
+ 
+     int lookup_index = -1;
+-    if (address >= 0x80000000u && address < 0x80000000u + m_lookup_ram_size)
++    if (address < m_lookup_ram_size)
++    {
++      lookup_index = static_cast<int>(address >> 2);
++    }
++    else if (address >= 0x80000000u && address < 0x80000000u + m_lookup_ram_size)
+     {
+       lookup_index = static_cast<int>((address - 0x80000000u) >> 2);
+     }
+@@ -111,11 +177,21 @@ void StaticRecompCore::Run()
+   };
+   m_module_active = m_module && (initial_game_id.empty() || initial_game_id == m_module->game_id);
+ 
++#ifdef MODERNGEKKO_NATIVE_ONLY
++  if (!m_module_active)
++  {
++    std::fprintf(stderr, "[native-only] no matching native module for game '%s'; stopping\n",
++                 initial_game_id.c_str());
++    m_system.GetCPU().Break();
++    return;
++  }
++#else
+   if (!m_module_active && m_fallback_jit && !m_guest.host_call)
+   {
+     m_fallback_jit->Run();
+     return;
+   }
++#endif
+ 
+   while (*state_ptr == CPU::State::Running)
+   {
+@@ -154,8 +230,39 @@ void StaticRecompCore::Run()
+           u32 linked_dispatch_address = runtime_dispatch_address;
+           if (m_has_rel_modules)
+             ResolveNativeAddress(runtime_dispatch_address, &linked_dispatch_address, nullptr);
++          if (runtime_dispatch_address == 0x805B62A0u)
++            LogGuestPanic(m_guest);
+           m_guest.pc = linked_dispatch_address;
+-          m_module->dispatch(&m_guest, linked_dispatch_address);
++#ifdef MODERNGEKKO_NATIVE_ONLY
++          m_native_only_fault_pc = 0;
++          m_native_only_fault_instruction = 0;
++#endif
++          const int dispatched = m_module->dispatch(&m_guest, linked_dispatch_address);
++#ifdef MODERNGEKKO_NATIVE_ONLY
++          if (m_native_only_fault_pc != 0)
++          {
++            m_guest.pc = m_native_only_fault_pc;
++            SyncOut();
++            std::fprintf(stderr,
++                         "[native-only] unsupported PPC instruction %08x at %08x; stopping without PPC fallback\n",
++                         m_native_only_fault_instruction, m_native_only_fault_pc);
++            m_system.GetCPU().Break();
++            return;
++          }
++#endif
++          if (!dispatched)
++          {
++#ifdef MODERNGEKKO_NATIVE_ONLY
++            m_guest.pc = runtime_dispatch_address;
++            SyncOut();
++            std::fprintf(stderr, "[native-only] module declined covered PC %08x; stopping\n",
++                         runtime_dispatch_address);
++            m_system.GetCPU().Break();
++            return;
++#else
++            // Preserve upstream behavior for non-native-only builds.
++#endif
++          }
+           if (m_has_rel_modules)
+             m_guest.pc = TranslateRelAddress(m_guest.pc);
+           ++m_native_dispatches;
+@@ -182,8 +289,9 @@ void StaticRecompCore::Run()
+           m_timebase_cycle_remainder = total_cycles % SystemTimers::TIMER_RATIO;
+ 
+           // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
+-          if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
++          if (m_guest.pc == m_idle_pc && m_idle_pc != 0 && (m_guest.msr & 0x8000u) != 0)
+           {
++            ++m_idle_skips;
+             m_system.GetCoreTiming().Idle();
+           }
+ 
+@@ -221,8 +329,10 @@ void StaticRecompCore::Run()
+           bool handled = m_guest.host_call(&m_guest, m_guest.pc);
+           if (!handled && m_guest.pc < m_guest.ram_size)
+             handled = m_guest.host_call(&m_guest, m_guest.pc | 0x80000000u);
++#ifndef MODERNGEKKO_NATIVE_ONLY
+           if (m_fallback_jit && IsHostCallAddress(m_guest.lr))
+             m_fallback_jit->GetBlockCache()->InvalidateICache(m_guest.lr, 4, true);
++#endif
+           if (handled)
+           {
+             const s64 charge = -m_guest.downcount;
+@@ -234,12 +344,27 @@ void StaticRecompCore::Run()
+             continue;
+           }
+           SyncOut();
++#ifdef MODERNGEKKO_NATIVE_ONLY
++          std::fprintf(stderr, "[native-only] unhandled native host call at %08x; stopping\n",
++                       ppc.pc);
++          m_system.GetCPU().Break();
++          return;
++#else
+           if (m_fallback_jit)
+           {
+             m_host_call_passthrough_pc = ppc.pc;
+             m_host_call_passthrough = true;
+           }
++#endif
+         }
++#ifdef MODERNGEKKO_NATIVE_ONLY
++        SyncIn();
++        const u32 uncovered_pc = ppc.pc;
++        SyncOut();
++        std::fprintf(stderr, "[native-only] uncovered PPC PC %08x; stopping\n", uncovered_pc);
++        m_system.GetCPU().Break();
++        return;
++#else
+         // SingleStepInner delivers synchronous exceptions itself; external
+         // interrupts are delivered at slice start, as in Interpreter::Run.
+         if (m_module_active && IsForcedFallbackAddress(ppc.pc))
+@@ -261,6 +386,7 @@ void StaticRecompCore::Run()
+                    !IsHostCallAddress(ppc.pc) && ppc.downcount > 0 &&
+                    *state_ptr == CPU::State::Running);
+         }
++#endif
+       }
+     } while (ppc.downcount > 0 && *state_ptr == CPU::State::Running);
+   }
+@@ -268,9 +394,14 @@ void StaticRecompCore::Run()
+ 
+ void StaticRecompCore::SingleStep()
+ {
++#ifdef MODERNGEKKO_NATIVE_ONLY
++  std::fprintf(stderr, "[native-only] debugger single-step is unavailable; stopping\n");
++  m_system.GetCPU().Break();
++#else
+   // Debugger stepping runs through the interpreter; state outside Run() lives
+   // in PowerPCState, so no sync is needed.
+   auto& system = m_system;
+   system.GetCoreTiming().Advance();
+   system.GetPPCState().downcount -= system.GetInterpreter().SingleStepInner();
++#endif
+ }
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+index 491c57e..1ef25fb 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+@@ -160,6 +160,11 @@ u32 StaticRecompCore::TranslateRelAddress(u32 linked_address)
+ 
+ int StaticRecompCore::GetAddressLookupIndex(u32 address) const
+ {
++  // Exception entry executes with instruction translation disabled.  Its
++  // architectural PC is the low physical address, even though the SDK
++  // installed the same bytes through the cached MEM1 alias.
++  if (address < m_lookup_ram_size)
++    return static_cast<int>(address >> 2);
+   if (address >= 0x80000000u && address < 0x80000000u + m_lookup_ram_size)
+     return static_cast<int>((address - 0x80000000u) >> 2);
+   if (address >= 0x90000000u && address < 0x90000000u + m_lookup_exram_size)
+@@ -286,11 +291,12 @@ void StaticRecompCore::VerifyChunk(u32 index)
+   const u32 ram_size = memory.GetRamSizeReal();
+   u32 runtime_start = chunk.start;
+   ResolveRuntimeAddress(chunk.start, &runtime_start);
+-  const u32 offset = runtime_start - 0x80000000u;
++  const u32 offset = runtime_start < ram_size ? runtime_start : runtime_start - 0x80000000u;
+   const u32 length = chunk.end - chunk.start;
+   ++m_verifications;
+ 
+-  if (runtime_start < 0x80000000u || offset >= ram_size || length > ram_size - offset)
++  const bool in_mem1 = runtime_start < ram_size || runtime_start >= 0x80000000u;
++  if (!in_mem1 || offset >= ram_size || length > ram_size - offset)
+   {
+     m_chunk_state[index] = CHUNK_FAILED;
+     ++m_failed_chunks;
+@@ -319,6 +325,13 @@ void StaticRecompCore::VerifyChunk(u32 index)
+   {
+     m_chunk_state[index] = CHUNK_FAILED;
+     ++m_failed_chunks;
++#ifdef MODERNGEKKO_NATIVE_ONLY
++    std::fprintf(stderr,
++                 "[native-only] SMC: refusing changed chunk [0x%08X,0x%08X) (%u failed)\n",
++                 chunk.start, chunk.end, m_failed_chunks);
++    WARN_LOG_FMT(POWERPC, "StaticRecomp: native dispatch refused for changed chunk [0x{:08X},0x{:08X})",
++                 chunk.start, chunk.end);
++#else
+     std::fprintf(stderr,
+                  "[staticrecomp] SMC: chunk [0x%08X,0x%08X) hash mismatch; interpreter until "
+                  "next invalidation (%u failed)\n",
+@@ -327,6 +340,7 @@ void StaticRecompCore::VerifyChunk(u32 index)
+                  "StaticRecomp: chunk [0x{:08X},0x{:08X}) failed verification (guest code "
+                  "differs from module); interpreter until next invalidation",
+                  chunk.start, chunk.end);
++#endif
+   }
+ }
+ 
+@@ -339,35 +353,50 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+ 
+   if (!m_module_active || length == 0)
+     return;
++  const u32 original_address = address;
+   u32 linked_address = address;
+   ResolveNativeAddress(address, &linked_address, nullptr);
+-  address = linked_address;
+-  const u32 last = address + (length - 1u);
+-
+-  // Binary search to find the first chunk index that could possibly overlap (chunk.end > address)
+-  u32 lo = 0;
+-  u32 hi = m_module->num_chunk_ranges;
+-  while (lo < hi)
+-  {
+-    const u32 mid = lo + (hi - lo) / 2;
+-    if (m_module->chunk_ranges[mid].end <= address)
+-      lo = mid + 1;
+-    else
+-      hi = mid;
+-  }
+-
+-  for (u32 i = lo; i < m_module->num_chunk_ranges; ++i)
++  const auto invalidate = [this](u32 start, u32 size) {
++    const u64 last = static_cast<u64>(start) + size - 1u;
++    // Binary search for the first possibly overlapping chunk.
++    u32 lo = 0;
++    u32 hi = m_module->num_chunk_ranges;
++    while (lo < hi)
++    {
++      const u32 mid = lo + (hi - lo) / 2;
++      if (m_module->chunk_ranges[mid].end <= start)
++        lo = mid + 1;
++      else
++        hi = mid;
++    }
++    for (u32 i = lo; i < m_module->num_chunk_ranges; ++i)
++    {
++      if (m_module->chunk_ranges[i].start > last)
++        break;
++      if (m_chunk_state[i] != CHUNK_UNVERIFIED)
++      {
++        if (m_chunk_state[i] == CHUNK_FAILED)
++          --m_failed_chunks;
++        m_chunk_state[i] = CHUNK_UNVERIFIED;
++        ++m_reverify_events;
++      }
++    }
++  };
++  invalidate(linked_address, length);
++
++  // SDK code installs vectors through a cached alias (0x80000500), while
++  // exception entry executes at the physical PC (0x500). Invalidate both
++  // descriptions of the same MEM1 bytes without changing dispatch PCs.
++  const u32 physical = original_address & 0x3fffffffu;
++  const bool mem1_alias = original_address < m_lookup_ram_size ||
++                         (original_address >= 0x80000000u && physical < m_lookup_ram_size);
++  if (mem1_alias)
+   {
+-    const auto& chunk = m_module->chunk_ranges[i];
+-    if (chunk.start > last)
+-      break;
+-
+-    if (m_chunk_state[i] != CHUNK_UNVERIFIED)
++    const u32 span = std::min(length, m_lookup_ram_size - physical);
++    if (span != 0)
+     {
+-      if (m_chunk_state[i] == CHUNK_FAILED)
+-        --m_failed_chunks;
+-      m_chunk_state[i] = CHUNK_UNVERIFIED;
+-      ++m_reverify_events;
++      invalidate(physical, span);
++      invalidate(physical | 0x80000000u, span);
+     }
+   }
+ }
+diff --git a/Source/Core/DolphinNoGUI/PlatformMacos.mm b/Source/Core/DolphinNoGUI/PlatformMacos.mm
+index e942282..5d23500 100644
+--- a/Source/Core/DolphinNoGUI/PlatformMacos.mm
++++ b/Source/Core/DolphinNoGUI/PlatformMacos.mm
+@@ -6,7 +6,9 @@
+ #include "Common/MsgHandler.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Core.h"
++#ifndef MODERNGEKKO_NATIVE_ONLY
+ #include "Core/State.h"
++#endif
+ #include "Core/System.h"
+ #include "VideoCommon/EFBInterface.h"
+ #include "VideoCommon/Present.h"
+@@ -26,16 +28,19 @@ @interface Application : NSApplication
+ - (void)shutdown;
+ - (void)togglePause;
+ - (void)saveScreenShot;
++#ifndef MODERNGEKKO_NATIVE_ONLY
+ - (void)loadLastSaved;
+ - (void)undoLoadState;
+ - (void)undoSaveState;
+ - (void)loadState:(id)sender;
+ - (void)saveState:(id)sender;
++#endif
+ @end
+ 
+ @implementation Application
+ - (void)shutdown;
+ {
++  std::fprintf(stderr, "[platform-macos] Application shutdown selector invoked\n");
+   [self platform]->Stop();
+   [self stop:nil];
+ }
+@@ -54,6 +59,7 @@ - (void)saveScreenShot
+   Core::SaveScreenShot();
+ }
+ 
++#ifndef MODERNGEKKO_NATIVE_ONLY
+ - (void)loadLastSaved
+ {
+   State::LoadLastSaved(Core::System::GetInstance());
+@@ -78,6 +84,7 @@ - (void)saveState:(id)sender
+ {
+   State::Save(Core::System::GetInstance(), [sender tag]);
+ }
++#endif
+ @end
+ 
+ @interface AppDelegate : NSObject <NSApplicationDelegate>
+@@ -154,6 +161,7 @@ - (void)mouseExited:(NSEvent*)event
+ 
+ - (void)windowWillClose:(NSNotification*)notification
+ {
++  std::fprintf(stderr, "[platform-macos] WindowDelegate received NSWindowWillCloseNotification\n");
+   if (m_cursor_hidden)
+   {
+     [NSCursor unhide];
+@@ -164,6 +172,11 @@ - (void)windowWillClose:(NSNotification*)notification
+ 
+ namespace
+ {
++constexpr unsigned int MIN_WINDOW_WIDTH = 320;
++constexpr unsigned int MIN_WINDOW_HEIGHT = 240;
++constexpr unsigned int DEFAULT_WINDOW_WIDTH = 1280;
++constexpr unsigned int DEFAULT_WINDOW_HEIGHT = 720;
++
+ class PlatformMacOS : public Platform
+ {
+ public:
+@@ -202,6 +215,16 @@ - (void)windowWillClose:(NSNotification*)notification
+ 
+ bool PlatformMacOS::Init()
+ {
++  // Old or interrupted sessions can leave a zero-sized saved window. Metal
++  // cannot obtain a drawable from a zero-sized CAMetalLayer, so start with a
++  // usable default instead of passing invalid geometry to NSWindow.
++  if (m_window_width < MIN_WINDOW_WIDTH || m_window_height < MIN_WINDOW_HEIGHT ||
++      m_window_width > 16384 || m_window_height > 16384)
++  {
++    m_window_width = DEFAULT_WINDOW_WIDTH;
++    m_window_height = DEFAULT_WINDOW_HEIGHT;
++  }
++
+   [Application sharedApplication];
+ 
+   m_app_delegate = [[AppDelegate alloc] initWithPlatform:this];
+@@ -340,6 +363,9 @@ - (void)windowWillClose:(NSNotification*)notification
+     return;
+ 
+   NSRect win = [m_window contentRectForFrameRect:[m_window frame]];
++  if (win.size.width < MIN_WINDOW_WIDTH || win.size.height < MIN_WINDOW_HEIGHT ||
++      win.size.width > 16384 || win.size.height > 16384)
++    return;
+   m_window_x = win.origin.x;
+   m_window_y = win.origin.y;
+   m_window_width = win.size.width;
+@@ -353,13 +379,16 @@ - (void)windowWillClose:(NSNotification*)notification
+     menuBar = [NSMenu new];
+ 
+     NSMenu* appMenu = [NSMenu new];
++#ifndef MODERNGEKKO_NATIVE_ONLY
+     NSMenu* stateMenu = [[NSMenu alloc] initWithTitle:@"States"];
+     NSMenu* loadStateMenu = [[NSMenu alloc] initWithTitle:@"Load"];
+     NSMenu* saveStateMenu = [[NSMenu alloc] initWithTitle:@"Save"];
++#endif
+     NSMenu* miscMenu = [[NSMenu alloc] initWithTitle:@"Misc"];
+ 
+     NSMenuItem* appMenuItem = [NSMenuItem new];
+     NSMenuItem* miscMenuItem = [NSMenuItem new];
++#ifndef MODERNGEKKO_NATIVE_ONLY
+     NSMenuItem* stateMenuItem = [NSMenuItem new];
+     NSMenuItem* loadStateItem = [[NSMenuItem alloc] initWithTitle:@"Load"
+                                                            action:nil
+@@ -367,12 +396,19 @@ - (void)windowWillClose:(NSNotification*)notification
+     NSMenuItem* saveStateItem = [[NSMenuItem alloc] initWithTitle:@"Save"
+                                                            action:nil
+                                                     keyEquivalent:@""];
++#endif
+     [menuBar addItem:appMenuItem];
++#ifndef MODERNGEKKO_NATIVE_ONLY
+     [menuBar addItem:stateMenuItem];
++#endif
+     [menuBar addItem:miscMenuItem];
+ 
+     // Quit
++#ifdef MODERNGEKKO_NATIVE_ONLY
++    NSString* quitTitle = [@"Quit " stringByAppendingString:@"SMG2 Native"];
++#else
+     NSString* quitTitle = [@"Quit " stringByAppendingString:@"dolphin-emu-nogui"];
++#endif
+     NSMenuItem* quitMenuItem = [[NSMenuItem alloc] initWithTitle:quitTitle
+                                                           action:@selector(shutdown)
+                                                    keyEquivalent:@"q"];
+@@ -402,6 +438,7 @@ - (void)windowWillClose:(NSNotification*)notification
+                                                 keyEquivalent:f10];
+     [pauseItem setKeyEquivalentModifierMask:NSEventModifierFlagFunction];
+ 
++#ifndef MODERNGEKKO_NATIVE_ONLY
+     // Load last save
+     NSString* loadLastTitle = @"Load Last Saved";
+     c = NSF11FunctionKey;
+@@ -451,9 +488,6 @@ - (void)windowWillClose:(NSNotification*)notification
+       [saveStateMenu addItem:sstateItem];
+     }
+ 
+-    // App Main menu
+-    [appMenu addItem:quitMenuItem];
+-
+     // State Menu
+     [loadStateItem setSubmenu:loadStateMenu];
+     [saveStateItem setSubmenu:saveStateMenu];
+@@ -463,6 +497,10 @@ - (void)windowWillClose:(NSNotification*)notification
+     [stateMenu addItem:undoSaveItem];
+     [stateMenu addItem:loadStateItem];
+     [stateMenu addItem:saveStateItem];
++#endif
++
++    // App Main menu
++    [appMenu addItem:quitMenuItem];
+ 
+     // Misc Menu
+     [miscMenu addItem:fullScreenItem];
+@@ -470,7 +508,9 @@ - (void)windowWillClose:(NSNotification*)notification
+     [miscMenu addItem:pauseItem];
+ 
+     [appMenuItem setSubmenu:appMenu];
++#ifndef MODERNGEKKO_NATIVE_ONLY
+     [stateMenuItem setSubmenu:stateMenu];
++#endif
+     [miscMenuItem setSubmenu:miscMenu];
+ 
+     [NSApp setMainMenu:menuBar];
+@@ -479,7 +519,9 @@ - (void)windowWillClose:(NSNotification*)notification
+ 
+ void PlatformMacOS::SaveWindowGeometry()
+ {
+-  if (Config::Get(Config::MAIN_RENDER_WINDOW_SAVE_ON_EXIT))
++  if (Config::Get(Config::MAIN_RENDER_WINDOW_SAVE_ON_EXIT) &&
++      m_window_width >= MIN_WINDOW_WIDTH && m_window_height >= MIN_WINDOW_HEIGHT &&
++      m_window_width <= 16384 && m_window_height <= 16384)
+   {
+     Config::SetBaseOrCurrent(Config::MAIN_RENDER_WINDOW_WIDTH, static_cast<int>(m_window_width));
+     Config::SetBaseOrCurrent(Config::MAIN_RENDER_WINDOW_HEIGHT, static_cast<int>(m_window_height));
+diff --git a/Source/Core/InputCommon/ControllerEmu/ControlGroup/Force.cpp b/Source/Core/InputCommon/ControllerEmu/ControlGroup/Force.cpp
+index d74c4df..a36fc9b 100644
+--- a/Source/Core/InputCommon/ControllerEmu/ControlGroup/Force.cpp
++++ b/Source/Core/InputCommon/ControllerEmu/ControlGroup/Force.cpp
+@@ -170,6 +170,23 @@ Shake::StateData Shake::GetState(bool adjusted) const
+   return result;
+ }
+ 
++Shake::StateData Shake::GetState(const InputOverrideFunction& override_func) const
++{
++  StateData result = GetState();
++  if (!override_func)
++    return result;
++
++  for (std::size_t i = 0; i != result.data.size(); ++i)
++  {
++    if (const std::optional<ControlState> override_state =
++            override_func(name, controls[i]->name, result.data[i]))
++    {
++      result.data[i] = *override_state;
++    }
++  }
++  return result;
++}
++
+ ControlState Shake::GetDeadzone() const
+ {
+   return m_deadzone_setting.GetValue() / 100;
+diff --git a/Source/Core/InputCommon/ControllerEmu/ControlGroup/Force.h b/Source/Core/InputCommon/ControllerEmu/ControlGroup/Force.h
+index abe02a4..70462bb 100644
+--- a/Source/Core/InputCommon/ControllerEmu/ControlGroup/Force.h
++++ b/Source/Core/InputCommon/ControllerEmu/ControlGroup/Force.h
+@@ -50,6 +50,7 @@ public:
+   explicit Shake(const std::string& name, ControlState default_intensity_scale = 1);
+ 
+   StateData GetState(bool adjusted = true) const;
++  StateData GetState(const InputOverrideFunction& override_func) const;
+ 
+   ControlState GetDeadzone() const;
+ 
+diff --git a/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.cpp b/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.cpp
+index 9ddbaff..1ed223e 100644
+--- a/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.cpp
++++ b/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.cpp
+@@ -91,6 +91,7 @@ const ControlsMap s_wiimote_controls_map = {{
+      ControlID::WIIMOTE_IR_X},
+     {{WiimoteEmu::Wiimote::IR_GROUP, ControllerEmu::ReshapableInput::Y_INPUT_OVERRIDE},
+      ControlID::WIIMOTE_IR_Y},
++    {{WiimoteEmu::Wiimote::SHAKE_GROUP, _trans("X")}, ControlID::WIIMOTE_SHAKE_X},
+ }};
+ 
+ const ControlsMap s_nunchuk_controls_map = {{
+diff --git a/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.h b/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.h
+index 6217b44..6528bdc 100644
+--- a/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.h
++++ b/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.h
+@@ -67,13 +67,14 @@ enum ControlID
+   CLASSIC_LEFT_STICK_Y = 53,
+   CLASSIC_RIGHT_STICK_X = 54,
+   CLASSIC_RIGHT_STICK_Y = 55,
++  WIIMOTE_SHAKE_X = 56,
+ 
+   NUMBER_OF_CONTROLS,
+ 
+   FIRST_GC_CONTROL = GCPAD_A_BUTTON,
+   LAST_GC_CONTROL = GCPAD_C_STICK_Y,
+   FIRST_WII_CONTROL = WIIMOTE_A_BUTTON,
+-  LAST_WII_CONTROL = CLASSIC_RIGHT_STICK_Y,
++  LAST_WII_CONTROL = WIIMOTE_SHAKE_X,
+ 
+ };
+ void RegisterGameCubeInputOverrider(int controller_index);
+diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
+index dac92e8..fe0ac72 100644
+--- a/module-template/CMakeLists.txt
++++ b/module-template/CMakeLists.txt
+@@ -40,12 +40,18 @@ set(MODULE_NAME "g${GAME_ID}_recomp")
+ find_package(Python3 REQUIRED COMPONENTS Interpreter)
+ 
+ set(MODULE_TABLES "${CMAKE_CURRENT_BINARY_DIR}/module_tables.inc")
++set(MODULE_TABLES_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/gen_module_tables.py"
++    CACHE FILEPATH "Module chunk/range table generator")
++set(MODULE_TABLES_GENERATOR_ARGS
++    "${GENERATED_DIR}/generated.h;${GENERATED_DIR}/generated_smc.txt;${GENERATED_DIR}/main.dol;${MODULE_TABLES}"
++    CACHE STRING "Arguments passed to the selected module table generator")
++set(MODULE_EXPORT_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/module_export.c"
++    CACHE FILEPATH "Module descriptor export glue source")
++set(MODULE_EXTRA_SOURCES "" CACHE STRING "Additional sources compiled into the module")
+ add_custom_command(
+   OUTPUT "${MODULE_TABLES}"
+-  COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/gen_module_tables.py"
+-          "${GENERATED_DIR}/generated.h" "${GENERATED_DIR}/generated_smc.txt"
+-          "${GENERATED_DIR}/main.dol" "${MODULE_TABLES}"
+-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gen_module_tables.py"
++  COMMAND Python3::Interpreter "${MODULE_TABLES_GENERATOR}" ${MODULE_TABLES_GENERATOR_ARGS}
++  DEPENDS "${MODULE_TABLES_GENERATOR}"
+           "${GENERATED_DIR}/generated.h" "${GENERATED_DIR}/generated_smc.txt"
+           "${GENERATED_DIR}/main.dol"
+   COMMENT "Generating module_tables.inc")
+@@ -85,7 +91,8 @@ if(NOT CHUNK_INPUTS)
+ endif()
+ 
+ add_library(${MODULE_NAME} SHARED
+-  module_export.c
++  "${MODULE_EXPORT_SOURCE}"
++  ${MODULE_EXTRA_SOURCES}
+   "${MODULE_TABLES}"
+   "${GXRUNTIME_DIR}/src/core/cpu.c"
+   "${GXRUNTIME_DIR}/src/core/cpu_exception.c"

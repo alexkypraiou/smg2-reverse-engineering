@@ -1,0 +1,562 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c0548a0..4239ef6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -20,6 +20,8 @@ option(MODERNGEKKO_ENABLE_DYNAMIC_MODULES
+ 
+ option(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME
+        "Build the RecompCore/Dolphin production chassis" ON)
++option(MODERNGEKKO_NATIVE_ONLY
++       "Fail closed when statically recompiled code is unavailable; never construct or run a PPC JIT/interpreter" OFF)
+ option(MODERNGEKKO_ENABLE_DOLPHIN_TESTS
+        "Build the imported Dolphin unit-test targets" OFF)
+ option(MODERNGEKKO_ENABLE_DISC_TOOL
+@@ -122,6 +124,9 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     set(LINUX_LOCAL_DEV ON CACHE BOOL "" FORCE)
+     set(DISTRIBUTOR "ModernGekko" CACHE STRING "" FORCE)
+     add_subdirectory(vendor/dolphin EXCLUDE_FROM_ALL)
++    if(MODERNGEKKO_NATIVE_ONLY)
++        target_compile_definitions(core PRIVATE MODERNGEKKO_NATIVE_ONLY=1)
++    endif()
+     add_library(moderngekko_gxruntime_core STATIC
+         vendor/dolphin/GXRuntime/src/core/cpu_exception.c)
+     target_include_directories(moderngekko_gxruntime_core PUBLIC
+@@ -190,6 +195,12 @@ add_library(moderngekko STATIC
+     src/runtime/mod_loader.cpp
+     src/runtime/game.cpp
+ )
++
++if(MODERNGEKKO_NATIVE_ONLY)
++    # The frontend must select only StaticRecomp as well as compile the core
++    # without interpreter/JIT fallback paths.
++    target_compile_definitions(moderngekko PRIVATE MODERNGEKKO_NATIVE_ONLY=1)
++endif()
+ add_library(ModernGekko::Runtime ALIAS moderngekko)
+ 
+ add_library(moderngekko_dolphin_video STATIC
+@@ -655,6 +666,31 @@ if(WIN32)
+ endif()
+ 
+ if(BUILD_TESTING)
++    set(SMG2_TEST_GAME_ROOT "" CACHE PATH "Optional extracted SB4E01 DATA root for native-only integration tests")
++    if(MODERNGEKKO_NATIVE_ONLY AND MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME AND SMG2_TEST_GAME_ROOT)
++        add_executable(moderngekko_native_only_run_test
++            tests/native_only_run_test.cpp
++        )
++        target_include_directories(moderngekko_native_only_run_test PRIVATE
++            "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core"
++            "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include"
++        )
++        target_compile_features(moderngekko_native_only_run_test PRIVATE cxx_std_23)
++        target_compile_definitions(moderngekko_native_only_run_test PRIVATE
++            MODERNGEKKO_NATIVE_ONLY=1
++            SMG2_TEST_GAME_ROOT="${SMG2_TEST_GAME_ROOT}"
++        )
++        if(APPLE)
++            target_compile_definitions(moderngekko_native_only_run_test PRIVATE
++                _ARCH_64=1 _M_ARM_64=1
++            )
++        endif()
++        target_link_libraries(moderngekko_native_only_run_test
++            PRIVATE moderngekko core uicommon)
++        add_test(NAME moderngekko.native_only_run
++                 COMMAND moderngekko_native_only_run_test)
++    endif()
++
+     add_executable(moderngekko_dol_patch_test
+         tests/dol_patch_test.cpp
+         tools/dol_patch.cpp)
+diff --git a/src/runtime/dolphin_runtime.cpp b/src/runtime/dolphin_runtime.cpp
+index f9b5405..15cf09a 100644
+--- a/src/runtime/dolphin_runtime.cpp
++++ b/src/runtime/dolphin_runtime.cpp
+@@ -42,7 +42,6 @@
+ #include <fstream>
+ #include <fmt/format.h>
+ #include <mutex>
+-#include <stop_token>
+ #include <thread>
+ #include <utility>
+ 
+@@ -96,6 +95,9 @@ std::string FormatWindowTitle(const std::string &title, double fps) {
+ }
+ 
+ PowerPC::CPUCore SelectCPUCore() {
++#ifdef MODERNGEKKO_NATIVE_ONLY
++  return PowerPC::CPUCore::StaticRecomp;
++#else
+   static const bool static_recomp = [] {
+     const char *v = std::getenv("MODERNGEKKO_STATICRECOMP");
+     return !v || !*v || *v != '0';
+@@ -107,6 +109,7 @@ PowerPC::CPUCore SelectCPUCore() {
+ #else
+   return PowerPC::CPUCore::JIT64;
+ #endif
++#endif
+ }
+ } // namespace
+ 
+@@ -284,7 +287,7 @@ std::optional<RuntimeError> WriteAutomationMemory(u32 address,
+ std::optional<RuntimeError> ApplyAutomationCommand(Runtime& runtime,
+                                                    RuntimeAutomationState& state,
+                                                    const automation::Command& command,
+-                                                   std::stop_token stop_token)
++                                                   const std::atomic_bool& stop_requested)
+ {
+   auto& system = Core::System::GetInstance();
+   switch (command.type)
+@@ -301,7 +304,7 @@ std::optional<RuntimeError> ApplyAutomationCommand(Runtime& runtime,
+     }
+     std::uint64_t first_frame = state.frame_count.load(std::memory_order_relaxed);
+     ApplyAutomationPad(command.pad);
+-    while (!stop_token.stop_requested())
++    while (!stop_requested.load(std::memory_order_relaxed))
+     {
+       const std::uint64_t current_frame =
+           state.frame_count.load(std::memory_order_relaxed);
+@@ -445,7 +448,7 @@ void WriteAutomationStatus(const std::filesystem::path& root, ImplT& impl)
+ }
+ 
+ template <typename ImplT>
+-void AutomationLoop(Runtime& runtime, ImplT& impl, std::stop_token stop_token)
++void AutomationLoop(Runtime& runtime, ImplT& impl, const std::atomic_bool& stop_requested)
+ {
+   const std::filesystem::path root = impl.config.automation.directory;
+   if (root.empty())
+@@ -453,7 +456,7 @@ void AutomationLoop(Runtime& runtime, ImplT& impl, std::stop_token stop_token)
+ 
+   EnsureAutomationDirectories(root);
+   auto next_status_write = std::chrono::steady_clock::now();
+-  while (!stop_token.stop_requested())
++  while (!stop_requested.load(std::memory_order_relaxed))
+   {
+ 
+     for (const auto& command_path : automation::ListCommandFiles(root / "commands"))
+@@ -475,7 +478,7 @@ void AutomationLoop(Runtime& runtime, ImplT& impl, std::stop_token stop_token)
+         command.path = automation::ResolveControlPath(root, command.path);
+ 
+       if (auto runtime_error =
+-              ApplyAutomationCommand(runtime, impl.automation_state, command, stop_token))
++              ApplyAutomationCommand(runtime, impl.automation_state, command, stop_requested))
+       {
+         SetAutomationError(impl.automation_state,
+                            command.source_name + ": " + runtime_error->message);
+@@ -514,7 +517,8 @@ struct Runtime::Impl {
+   RuntimeAutomationState automation_state;
+   Common::EventHook present_hook;
+   bool automation_registered = false;
+-  std::jthread automation_thread;
++  std::atomic_bool automation_stop_requested{false};
++  std::thread automation_thread;
+ };
+ 
+ namespace detail {
+@@ -743,7 +747,7 @@ Runtime::~Runtime() {
+ 
+ void Runtime::StopAutomation() {
+   if (m_impl->automation_thread.joinable()) {
+-    m_impl->automation_thread.request_stop();
++    m_impl->automation_stop_requested.store(true, std::memory_order_relaxed);
+     m_impl->automation_thread.join();
+   }
+   m_impl->present_hook = {};
+@@ -779,6 +783,11 @@ RuntimeRunResult Runtime::Run() {
+   }
+   m_impl->state_hook =
+       Core::AddOnStateChangedCallback([this](Core::State state) {
++        if (state == Core::State::Uninitialized) {
++          std::fprintf(stderr,
++                       "[runtime] Core state transitioned to Uninitialized; platform=%p; requesting platform stop\n",
++                       static_cast<void*>(m_impl->platform.get()));
++        }
+         if (state == Core::State::Uninitialized && m_impl->platform)
+           m_impl->platform->Stop();
+       });
+@@ -798,23 +807,25 @@ RuntimeRunResult Runtime::Run() {
+                                                      std::memory_order_relaxed);
+       });
+   if (!m_impl->config.automation.directory.empty()) {
++    m_impl->automation_stop_requested.store(false, std::memory_order_relaxed);
+     m_impl->automation_thread =
+-        std::jthread([this](std::stop_token stop_token) {
+-          AutomationLoop(*this, *m_impl, std::move(stop_token));
++        std::thread([this] {
++          AutomationLoop(*this, *m_impl, m_impl->automation_stop_requested);
+         });
+   }
+-  std::jthread title_thread;
++  std::atomic_bool title_stop_requested{false};
++  std::thread title_thread;
+   if (!m_impl->config.headless && m_impl->config.show_fps_in_title) {
+-    title_thread = std::jthread([](std::stop_token stop_token) {
+-      while (!stop_token.stop_requested()) {
++    title_thread = std::thread([&title_stop_requested] {
++      while (!title_stop_requested.load(std::memory_order_relaxed)) {
+         Host_UpdateTitle({});
+-        for (int i = 0; i < 10 && !stop_token.stop_requested(); ++i)
++        for (int i = 0; i < 10 && !title_stop_requested.load(std::memory_order_relaxed); ++i)
+           std::this_thread::sleep_for(std::chrono::milliseconds(100));
+       }
+     });
+   }
+   m_impl->platform->MainLoop();
+-  title_thread.request_stop();
++  title_stop_requested.store(true, std::memory_order_relaxed);
+   if (title_thread.joinable())
+     title_thread.join();
+   m_impl->platform->SaveWindowGeometry();
+@@ -828,7 +839,13 @@ RuntimeRunResult Runtime::Run() {
+ 
+ void Runtime::RequestStop() {
+   if (m_impl && m_impl->platform)
++#ifdef MODERNGEKKO_NATIVE_ONLY
++    // This API stops the standalone host app; RequestShutdown instead asks
++    // Dolphin's Wii power-button/STM path to shut down emulation gracefully.
++    m_impl->platform->Stop();
++#else
+     m_impl->platform->RequestShutdown();
++#endif
+ }
+ 
+ std::optional<RuntimeError> Runtime::Pause() {
+diff --git a/tests/automation_protocol_test.cpp b/tests/automation_protocol_test.cpp
+index 812f449..7670157 100644
+--- a/tests/automation_protocol_test.cpp
++++ b/tests/automation_protocol_test.cpp
+@@ -3,6 +3,10 @@
+ #include <filesystem>
+ #include <fstream>
+ 
++static_assert(ciface::Touch::CLASSIC_RIGHT_STICK_Y == 55);
++static_assert(ciface::Touch::WIIMOTE_SHAKE_X == 56);
++static_assert(ciface::Touch::LAST_WII_CONTROL == ciface::Touch::WIIMOTE_SHAKE_X);
++
+ namespace
+ {
+ std::filesystem::path MakeTempDirectory()
+@@ -31,7 +35,8 @@ int main()
+            << "port=1\n"
+            << "a=1\n"
+            << "main_x=0.5\n"
+-           << "main_y=-1\n";
++           << "main_y=-1\n"
++           << "wii_shake_x=0.75\n";
+   }
+   {
+     std::ofstream output(commands / "001_pause.txt");
+@@ -52,11 +57,19 @@ int main()
+   if (command.type != automation::CommandType::Pad || command.pad.port != 1)
+     return 3;
+   if (command.pad.controls[0] != 1.0 || command.pad.controls[14] != 0.5 ||
+-      command.pad.controls[15] != -1.0)
++      command.pad.controls[15] != -1.0 || command.pad.controls[56] != 0.75)
+   {
+     return 4;
+   }
+ 
++  {
++    std::ofstream output(commands / "009_bad_shake.txt");
++    output << "command=pad\nport=0\nwii_shake_x=1.1\n";
++  }
++  error.clear();
++  if (automation::ParseCommandFile(commands / "009_bad_shake.txt", &command, &error))
++    return 15;
++
+   {
+     std::ofstream output(commands / "003_bad.txt");
+     output << "command=pad\nport=0\nunknown=1\n";
+diff --git a/tests/frontend_config_test.cpp b/tests/frontend_config_test.cpp
+index 6bb9e0e..7ce7c81 100644
+--- a/tests/frontend_config_test.cpp
++++ b/tests/frontend_config_test.cpp
+@@ -57,6 +57,14 @@ int main() {
+     return 7;
+   }
+ 
++  auto metal_config = netplay_config;
++  metal_config.graphics_backend = "mEtAl";
++  if (!moderngekko::frontend::SaveConfig(directory, metal_config, &error))
++    return 14;
++  const auto metal_loaded = moderngekko::frontend::LoadConfig(directory, false);
++  if (!metal_loaded || metal_loaded.graphics_backend != "Metal")
++    return 15;
++
+   auto invalid_netplay = netplay_config;
+   invalid_netplay.netplay_address = "not a host";
+   if (moderngekko::frontend::SaveConfig(directory, invalid_netplay, &error))
+diff --git a/tools/automation_protocol.cpp b/tools/automation_protocol.cpp
+index 25f4167..7f08d8c 100644
+--- a/tools/automation_protocol.cpp
++++ b/tools/automation_protocol.cpp
+@@ -58,6 +58,7 @@ constexpr std::array kPadFields = {
+     PadField{"wii_dpad_right", ControlID::WIIMOTE_DPAD_RIGHT, 0.0, 1.0},
+     PadField{"wii_ir_x", ControlID::WIIMOTE_IR_X, -1.0, 1.0},
+     PadField{"wii_ir_y", ControlID::WIIMOTE_IR_Y, -1.0, 1.0},
++    PadField{"wii_shake_x", ControlID::WIIMOTE_SHAKE_X, 0.0, 1.0},
+     PadField{"nunchuk_c", ControlID::NUNCHUK_C_BUTTON, 0.0, 1.0},
+     PadField{"nunchuk_z", ControlID::NUNCHUK_Z_BUTTON, 0.0, 1.0},
+     PadField{"nunchuk_x", ControlID::NUNCHUK_STICK_X, -1.0, 1.0},
+diff --git a/tools/frontend_config.cpp b/tools/frontend_config.cpp
+index 03740d4..752fea6 100644
+--- a/tools/frontend_config.cpp
++++ b/tools/frontend_config.cpp
+@@ -40,6 +40,8 @@ std::string NormalizeGraphicsBackend(std::string value) {
+     return "Vulkan";
+   if (lower == "opengl" || lower == "ogl")
+     return "OGL";
++  if (lower == "metal")
++    return "Metal";
+   return {};
+ }
+ 
+@@ -124,7 +126,7 @@ ConfigResult LoadConfig(const fs::path &user_directory,
+     else if (key == "backend" || key == "graphics_backend") {
+       config.graphics_backend = NormalizeGraphicsBackend(raw_value);
+       if (config.graphics_backend.empty())
+-        return {.error = "graphics backend must be Vulkan or OpenGL"};
++        return {.error = "graphics backend must be Vulkan, OpenGL or Metal"};
+     }
+     else if (key == "controller")
+       config.controller = raw_value;
+diff --git a/tools/moderngekko_run.cpp b/tools/moderngekko_run.cpp
+index d6b3569..cb4caae 100644
+--- a/tools/moderngekko_run.cpp
++++ b/tools/moderngekko_run.cpp
+@@ -17,6 +17,7 @@
+ #include <iostream>
+ #include <string>
+ #include <thread>
++#include <atomic>
+ #include <vector>
+ 
+ #if defined(_WIN32)
+@@ -395,8 +396,9 @@ int RunMain(int argc, char **argv) {
+ 
+   std::signal(SIGINT, HandleStopSignal);
+   std::signal(SIGTERM, HandleStopSignal);
+-  std::jthread signal_watcher([&](std::stop_token stop_token) {
+-    while (!stop_token.stop_requested()) {
++  std::atomic_bool signal_watcher_stop{false};
++  std::thread signal_watcher([&] {
++    while (!signal_watcher_stop.load(std::memory_order_relaxed)) {
+       if (s_stop_requested) {
+         s_stop_requested = 0;
+         created.runtime->RequestStop();
+@@ -406,7 +408,8 @@ int RunMain(int argc, char **argv) {
+     }
+   });
+   const moderngekko::RuntimeRunResult result = created.runtime->Run();
+-  signal_watcher.request_stop();
++  signal_watcher_stop.store(true, std::memory_order_relaxed);
++  signal_watcher.join();
+   if (result.error) {
+     std::cerr << "runtime failed: " << result.error->message << '\n';
+     return 1;
+diff --git a/tests/native_only_run_test.cpp b/tests/native_only_run_test.cpp
+new file mode 100644
+index 0000000..7a71050
+--- /dev/null
++++ b/tests/native_only_run_test.cpp
+@@ -0,0 +1,202 @@
++#include "moderngekko/runtime.hpp"
++
++#include "Common/CommonTypes.h"
++#include "Core/HW/CPU.h"
++#include "Core/PowerPC/JitInterface.h"
++#include "Core/PowerPC/PowerPC.h"
++#include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
++#include "Core/System.h"
++#include "Core/PowerPC/StaticRecomp/StaticRecompABI.h"
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <thread>
++#include <vector>
++
++#ifndef SMG2_TEST_GAME_ROOT
++#error SMG2_TEST_GAME_ROOT must point at the extracted SB4E01 data root
++#endif
++
++namespace
++{
++enum class Case { DeclineEntry, UncoveredAfterEntry, PhysicalVector, PhysicalSMC, Fallback };
++std::atomic<Case> s_case{Case::DeclineEntry};
++std::atomic<unsigned> s_dispatches{0};
++std::array<ModernGekkoRange, 2> s_ranges{{{0x500, 0x504}, {0x80004050, 0x80004054}}};
++std::array<std::uint64_t, 2> s_hashes{};
++ModernGekkoModuleDesc s_module{};
++std::filesystem::path s_test_root;
++
++bool PrepareRoot()
++{
++  s_test_root = SMG2_TEST_GAME_ROOT;
++  return std::filesystem::is_directory(s_test_root / "files") &&
++         std::filesystem::is_regular_file(s_test_root / "sys/main.dol");
++}
++
++std::uint64_t Hash(const std::uint8_t* bytes, std::size_t size)
++{
++  std::uint64_t hash = 0xCBF29CE484222325ull;
++  for (std::size_t i = 0; i < size; ++i) { hash ^= bytes[i]; hash *= 0x100000001B3ull; }
++  return hash;
++}
++
++int Dispatch(CPUState* cpu, std::uint32_t address)
++{
++  const unsigned call = s_dispatches.fetch_add(1) + 1;
++  std::fprintf(stderr, "native-only dispatch case=%d call=%u pc=%08x\n", int(s_case.load()), call, address);
++  switch (s_case.load())
++  {
++  case Case::DeclineEntry:
++    return 0;
++  case Case::UncoveredAfterEntry:
++    if (call == 1) { cpu->pc = 0x508; return 1; }
++    return 0;
++  case Case::PhysicalVector:
++    if (call == 1 && address == 0x80004050)
++    {
++      cpu->ram[0x500] = 0x60;
++      cpu->ram[0x501] = 0;
++      cpu->ram[0x502] = 0;
++      cpu->ram[0x503] = 0;
++      cpu->pc = 0x500;
++      return 1;
++    }
++    if (call == 2 && address == 0x500) { cpu->pc = 0x508; return 1; }
++    return 0;
++  case Case::PhysicalSMC:
++    if (call == 1 && address == 0x80004050)
++    {
++      cpu->ram[0x500] = 0x60; cpu->ram[0x501] = 0; cpu->ram[0x502] = 0; cpu->ram[0x503] = 0;
++      cpu->pc = 0x500;
++      return 1;
++    }
++    if (call == 2 && address == 0x500)
++    {
++      cpu->ram[0x503] = 1;
++      constexpr std::uint8_t kICBI = 3; // PPC_CACHE_ICBI in GXRuntime/core/cpu.h
++      cpu->cache_control(cpu, kICBI, 0x80000500, 0x500);
++      cpu->pc = 0x500;
++      return 1;
++    }
++    return 0;
++  case Case::Fallback:
++    cpu->instruction_fallback(cpu, 0x7C000000u, address);
++    return 1;
++  }
++  return 0;
++}
++
++bool PrepareDescriptor()
++{
++  const auto dol_path = s_test_root / "sys/main.dol";
++  std::ifstream input(dol_path, std::ios::binary);
++  std::vector<std::uint8_t> dol((std::istreambuf_iterator<char>(input)), {});
++  if (!input && dol.empty()) { std::fprintf(stderr, "fixture DOL unreadable: %s\n", dol_path.c_str()); return false; }
++  std::uint32_t entry = 0;
++  for (int i = 0; i < 4; ++i) entry = (entry << 8) | dol[0xE0 + i];
++  if (entry != 0x80004050) { std::fprintf(stderr, "unexpected SB4E01 entry 0x%08X\n", entry); return false; }
++  std::uint32_t file_offset = 0;
++  for (std::size_t section = 0; section < 7; ++section)
++  {
++    std::uint32_t off = 0, addr = 0, size = 0;
++    for (int i = 0; i < 4; ++i) { off = (off << 8) | dol[section * 4 + i]; addr = (addr << 8) | dol[0x48 + section * 4 + i]; size = (size << 8) | dol[0x90 + section * 4 + i]; }
++    if (entry >= addr && entry + 4 <= addr + size) { file_offset = off + entry - addr; break; }
++  }
++  if (!file_offset || file_offset + 4 > dol.size()) { std::fprintf(stderr, "fixture DOL entry section missing offset=%x size=%zu\n", file_offset, dol.size()); return false; }
++  constexpr std::array<std::uint8_t, 4> physical_word{0x60, 0, 0, 0};
++  s_hashes[0] = Hash(physical_word.data(), physical_word.size());
++  s_hashes[1] = Hash(dol.data() + file_offset, 4);
++  s_module = {};
++  s_module.abi_version = MODERNGEKKO_MODULE_ABI_VERSION;
++  s_module.cpu_abi_version = MODERNGEKKO_CPU_ABI_VERSION;
++  s_module.cpu_state_size = sizeof(CPUState);
++  std::memcpy(s_module.game_id, "SB4E01", 7);
++  s_module.entry_point = entry;
++  s_module.dispatch = Dispatch;
++  s_module.code_ranges = s_ranges.data();
++  s_module.num_code_ranges = s_ranges.size();
++  s_module.chunk_ranges = s_ranges.data();
++  s_module.num_chunk_ranges = s_ranges.size();
++  s_module.chunk_hashes = s_hashes.data();
++  return true;
++}
++
++bool RunCase(Case which, unsigned expected_calls, std::uint32_t expected_stop_pc)
++{
++  moderngekko::RuntimeConfig config;
++  config.game_root = s_test_root;
++  config.user_directory = std::filesystem::temp_directory_path() /
++                          ("smg2-native-only-run-test-" + std::to_string(int(which)));
++  config.headless = true;
++  config.show_fps_in_title = false;
++  config.module = moderngekko::ModuleSource::AttachedDescriptor(&s_module);
++  config.allow_interpreter = false;
++  std::fprintf(stderr, "native-only test: Runtime::Create starting case=%d\n", int(which));
++  auto created = moderngekko::Runtime::Create(std::move(config));
++  if (!created) { std::fprintf(stderr, "Runtime::Create failed: %s\n", created.error->message.c_str()); return false; }
++  std::fprintf(stderr, "native-only test: Runtime::Create ready case=%d\n", int(which));
++  s_case = which;
++  s_dispatches = 0;
++  auto runtime = std::move(created.runtime);
++  moderngekko::RuntimeRunResult result;
++  std::thread runner([&] { std::fprintf(stderr, "native-only test: Run starting case=%d\n", int(which)); result = runtime->Run(); std::fprintf(stderr, "native-only test: Run returned case=%d\n", int(which)); });
++  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
++  auto& system = Core::System::GetInstance();
++  bool stopped_at_guard = false;
++  bool no_jit = false;
++  std::uint32_t stop_pc = 0;
++  while (std::chrono::steady_clock::now() < deadline)
++  {
++    if (s_dispatches.load() >= expected_calls && system.GetCPU().GetState() == CPU::State::Stepping)
++    {
++      auto* core = dynamic_cast<StaticRecompCore*>(system.GetJitInterface().GetCore());
++      no_jit = core && core->GetExceptionCheckTarget() == core;
++      stop_pc = system.GetPowerPC().GetPPCState().pc;
++      stopped_at_guard = true;
++      break;
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(2));
++  }
++  const unsigned observed = s_dispatches.load();
++  runtime->RequestStop();
++  runner.join();
++  const bool ok = observed == expected_calls && stopped_at_guard && no_jit &&
++                  stop_pc == expected_stop_pc && !result.error;
++  if (!ok) std::fprintf(stderr, "case %d observed %u dispatches (expected %u), guard=%d no_jit=%d stop_pc=%08x expected=%08x\n", int(which), observed, expected_calls, stopped_at_guard, no_jit, stop_pc, expected_stop_pc);
++  return ok;
++}
++} // namespace
++
++int main(int argc, char** argv)
++{
++#ifndef MODERNGEKKO_NATIVE_ONLY
++  return 90;
++#endif
++  setenv("MODERNGEKKO_STATICRECOMP", "0", 1);
++  if (!PrepareRoot() || !PrepareDescriptor()) { std::fprintf(stderr, "could not prepare SB4E01 descriptor\n"); return 1; }
++  if (argc == 2)
++  {
++    const int selected = std::atoi(argv[1]);
++    if (selected == 0) return RunCase(Case::DeclineEntry, 1, 0x80004050) ? 0 : 2;
++    if (selected == 1) return RunCase(Case::UncoveredAfterEntry, 1, 0x508) ? 0 : 2;
++    if (selected == 2) return RunCase(Case::PhysicalVector, 2, 0x508) ? 0 : 2;
++    if (selected == 3) return RunCase(Case::PhysicalSMC, 2, 0x500) ? 0 : 2;
++    if (selected == 4) return RunCase(Case::Fallback, 1, 0x80004050) ? 0 : 2;
++    return 91;
++  }
++  const bool decline = RunCase(Case::DeclineEntry, 1, 0x80004050);
++  const bool uncovered = RunCase(Case::UncoveredAfterEntry, 1, 0x508);
++  const bool physical = RunCase(Case::PhysicalVector, 2, 0x508);
++  const bool physical_smc = RunCase(Case::PhysicalSMC, 2, 0x500);
++  const bool fallback = RunCase(Case::Fallback, 1, 0x80004050);
++  return decline && uncovered && physical && physical_smc && fallback ? 0 : 2;
++}
